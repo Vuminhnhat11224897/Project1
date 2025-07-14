@@ -36,7 +36,12 @@ class Config:
             "popular": {"enabled": True, "pages": 5},
             "trending_day": {"enabled": True, "pages": 2},
             "trending_week": {"enabled": True, "pages": 2},
-            "top_rated": {"enabled": True, "pages": 3}
+            "top_rated": {"enabled": True, "pages": 3},
+        "batch_size": 25,
+        "max_workers": 5,
+        "max_retries": 3,
+        "retry_backoff": 1.5,
+        "rate_limit_wait": 0.25
         }
     }
     

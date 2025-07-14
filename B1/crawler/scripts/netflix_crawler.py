@@ -7,6 +7,7 @@ import os
 import json
 import time
 import logging
+import argparse
 from datetime import datetime
 from typing import Dict, List, Optional, Set, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -47,6 +48,11 @@ class NetflixDataCrawler:
         # Khởi tạo TMDB client
         self.tmdb = TMDBClient(self.config)
         
+        # Khởi tạo cache manager
+        cache_dir = self.config.get("cache_dir", "cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        self.cache = CacheManager(cache_dir)
+        
         # Đường dẫn thư mục dữ liệu
         self.raw_data_dir = self.config.get("raw_data_dir")
         self.processed_data_dir = self.config.get("processed_data_dir")
@@ -55,7 +61,48 @@ class NetflixDataCrawler:
         os.makedirs(self.raw_data_dir, exist_ok=True)
         os.makedirs(self.processed_data_dir, exist_ok=True)
         
+        # Lấy các tham số cấu hình
+        self.batch_size = self.config.get("batch_size", 25)
+        self.max_workers = self.config.get("max_workers", 5)
+        self.max_retries = self.config.get("max_retries", 3)
+        self.retry_backoff = self.config.get("retry_backoff", 1.5)
+        self.rate_limit_wait = self.config.get("rate_limit_wait", 0.25)
+        
         logging.info(f"Netflix Data Crawler đã khởi tạo: raw_data_dir={self.raw_data_dir}")
+    
+    def with_retry(self, func, *args, max_retries=None, backoff_factor=None, **kwargs):
+        """
+        Thực hiện API call với cơ chế retry tự động
+        
+        Args:
+            func: Phương thức API cần gọi
+            max_retries: Số lần thử lại tối đa (None = dùng cấu hình)
+            backoff_factor: Hệ số tăng thời gian chờ (None = dùng cấu hình)
+            
+        Returns:
+            Kết quả từ API call hoặc None nếu tất cả các lần thử đều thất bại
+        """
+        if max_retries is None:
+            max_retries = self.max_retries
+            
+        if backoff_factor is None:
+            backoff_factor = self.retry_backoff
+            
+        retries = 0
+        last_exception = None
+        
+        while retries < max_retries:
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                last_exception = e
+                wait_time = backoff_factor * (2 ** retries)
+                logging.warning(f"API call failed: {e}. Retrying in {wait_time:.1f}s ({retries+1}/{max_retries})")
+                time.sleep(wait_time)
+                retries += 1
+        
+        logging.error(f"API call failed after {max_retries} retries: {last_exception}")
+        return None
     
     def crawl_movie_list(self, list_type: str, num_pages: int = 5) -> List[Dict]:
         """
@@ -76,17 +123,17 @@ class NetflixDataCrawler:
             logging.info(f"Crawling {list_type} page {page}/{num_pages}")
             
             if list_type == "popular":
-                movies = self.tmdb.get_popular_movies(page)
+                movies = self.with_retry(self.tmdb.get_popular_movies, page)
             elif list_type == "top_rated":
-                movies = self.tmdb.get_top_rated_movies(page)
+                movies = self.with_retry(self.tmdb.get_top_rated_movies, page)
             elif list_type == "now_playing":
-                movies = self.tmdb.get_now_playing_movies(page)
+                movies = self.with_retry(self.tmdb.get_now_playing_movies, page)
             elif list_type == "netflix":
-                movies = self.tmdb.get_netflix_movies(page)
+                movies = self.with_retry(self.tmdb.get_netflix_movies, page)
             elif list_type == "trending_day":
-                movies = self.tmdb.get_trending_movies("day", page)
+                movies = self.with_retry(self.tmdb.get_trending_movies, "day", page)
             elif list_type == "trending_week":
-                movies = self.tmdb.get_trending_movies("week", page)
+                movies = self.with_retry(self.tmdb.get_trending_movies, "week", page)
             else:
                 logging.warning(f"Unknown list type: {list_type}")
                 continue
@@ -98,14 +145,14 @@ class NetflixDataCrawler:
                 all_movies.extend(movies['results'])
                 logging.info(f"Found {len(movies['results'])} movies")
             
-            time.sleep(0.25)  # Rate limiting
+            time.sleep(self.rate_limit_wait)  # Rate limiting
         
         logging.info(f"Total {list_type} movies: {len(all_movies)}")
         return all_movies
     
     def crawl_movie_details(self, movie_id: int) -> Dict:
         """
-        Crawl thông tin chi tiết của một phim.
+        Crawl thông tin chi tiết của một phim với cache.
         
         Args:
             movie_id: ID của phim
@@ -114,6 +161,14 @@ class NetflixDataCrawler:
             Dict: Thông tin chi tiết của phim
         """
         logging.info(f"Crawling details for movie ID: {movie_id}")
+        
+        # Kiểm tra cache
+        cache_key = f"movie_details_{movie_id}"
+        cached_data = self.cache.get(cache_key)
+        
+        if cached_data:
+            logging.info(f"Using cached data for movie ID: {movie_id}")
+            return cached_data
         
         movie_data = {
             'movie_id': movie_id,
@@ -127,7 +182,7 @@ class NetflixDataCrawler:
         }
         
         # 1. Movie details
-        movie_details = self.tmdb.get_movie_details(movie_id)
+        movie_details = self.with_retry(self.tmdb.get_movie_details, movie_id)
         if movie_details:
             movie_data['details'] = movie_details
             logging.info(f"✓ Details: {movie_details.get('title', 'N/A')}")
@@ -136,7 +191,7 @@ class NetflixDataCrawler:
             return movie_data  # Return early if we can't get basic details
         
         # 2. Credits (cast & crew)
-        credits = self.tmdb.get_movie_credits(movie_id)
+        credits = self.with_retry(self.tmdb.get_movie_credits, movie_id)
         if credits:
             movie_data['credits'] = credits
             cast_count = len(credits.get('cast', []))
@@ -144,39 +199,65 @@ class NetflixDataCrawler:
             logging.info(f"✓ Credits: {cast_count} cast, {crew_count} crew")
         
         # 3. Keywords
-        keywords = self.tmdb.get_movie_keywords(movie_id)
+        keywords = self.with_retry(self.tmdb.get_movie_keywords, movie_id)
         if keywords:
             movie_data['keywords'] = keywords
             keyword_count = len(keywords.get('keywords', []))
             logging.info(f"✓ Keywords: {keyword_count} keywords")
         
         # 4. Videos/Trailers
-        videos = self.tmdb.get_movie_videos(movie_id)
+        videos = self.with_retry(self.tmdb.get_movie_videos, movie_id)
         if videos:
             movie_data['videos'] = videos
             video_count = len(videos.get('results', []))
             logging.info(f"✓ Videos: {video_count} videos")
         
         # 5. Reviews
-        reviews = self.tmdb.get_movie_reviews(movie_id)
+        reviews = self.with_retry(self.tmdb.get_movie_reviews, movie_id)
         if reviews:
             movie_data['reviews'] = reviews
             review_count = len(reviews.get('results', []))
             logging.info(f"✓ Reviews: {review_count} reviews")
         
         # 6. Similar movies
-        similar = self.tmdb.get_movie_similar(movie_id)
+        similar = self.with_retry(self.tmdb.get_movie_similar, movie_id)
         if similar:
             movie_data['similar'] = similar
             similar_count = len(similar.get('results', []))
             logging.info(f"✓ Similar: {similar_count} similar movies")
         
+        # Lưu vào cache nếu có dữ liệu cơ bản
+        if movie_data['details']:
+            self.cache.set(cache_key, movie_data)
+        
         return movie_data
+    
+    def save_movie_batch(self, movies, timestamp, batch_index):
+        """
+        Lưu một batch phim vào file riêng biệt
+        
+        Args:
+            movies: Danh sách phim cần lưu
+            timestamp: Timestamp cho tên file
+            batch_index: Chỉ số batch
+            
+        Returns:
+            str: Đường dẫn đến file đã lưu
+        """
+        if not movies:
+            return None
+            
+        batch_file = os.path.join(self.raw_data_dir, 
+                                  f"detailed_movies_batch_{batch_index}_{timestamp}.json")
+        self.save_json(movies, batch_file)
+        logging.info(f"Saved batch {batch_index}: {len(movies)} movies")
+        return batch_file
     
     def crawl_daily_netflix_data(self, 
                                 num_pages_per_source: int = None,
                                 max_movies: int = None,
-                                sources: List[str] = None) -> Dict:
+                                sources: List[str] = None,
+                                resume_from: str = None) -> Dict:
         """
         Crawl dữ liệu hàng ngày từ nhiều nguồn.
         
@@ -184,6 +265,7 @@ class NetflixDataCrawler:
             num_pages_per_source: Số trang mỗi nguồn (None = dùng cấu hình)
             max_movies: Số phim tối đa để crawl chi tiết (None = dùng cấu hình)
             sources: Danh sách nguồn để crawl (None = dùng tất cả nguồn được bật trong cấu hình)
+            resume_from: Đường dẫn file lưu danh sách movie_ids đã thất bại để thử lại
             
         Returns:
             Dict: Kết quả crawl với summary và danh sách phim
@@ -208,54 +290,85 @@ class NetflixDataCrawler:
         logging.info(f"- Pages per source: {num_pages_per_source}")
         logging.info(f"- Max movies for detailed crawl: {max_movies}")
         
-        # 1. Thu thập movie IDs từ các nguồn khác nhau
-        all_movie_ids = set()
-        movie_sources = {}
-        
-        for source in sources:
-            try:
-                # Điều chỉnh số trang theo cấu hình nguồn cụ thể nếu có
-                source_pages = self.config.get_nested("data_sources", source, "pages", default=num_pages_per_source)
-                movies = self.crawl_movie_list(source, source_pages)
-                
-                for movie in movies:
-                    movie_id = movie['id']
-                    all_movie_ids.add(movie_id)
-                    
-                    if movie_id not in movie_sources:
-                        movie_sources[movie_id] = []
-                    movie_sources[movie_id].append(source)
-                    
-            except Exception as e:
-                logging.error(f"Error crawling {source}: {e}")
-                continue
-        
-        logging.info(f"Collected {len(all_movie_ids)} unique movies from {len(sources)} sources")
-        
-        # 2. Lưu summary danh sách phim
-        movie_list_summary = {
-            'crawl_date': datetime.now().isoformat(),
-            'total_unique_movies': len(all_movie_ids),
-            'sources': sources,
-            'pages_per_source': num_pages_per_source,
-            'movie_sources': movie_sources
-        }
-        
+        # Tạo timestamp cho tên file
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        summary_file = os.path.join(self.raw_data_dir, f"movie_list_summary_{timestamp}.json")
-        self.save_json(movie_list_summary, summary_file)
         
-        # 3. Crawl thông tin chi tiết cho các phim đã chọn
-        # Giới hạn số lượng phim để crawl chi tiết
-        selected_movies = list(all_movie_ids)[:max_movies]
+        # Nếu là chế độ tiếp tục, load movie IDs đã thất bại
+        selected_movies = []
+        if resume_from and os.path.exists(resume_from):
+            try:
+                with open(resume_from, 'r') as f:
+                    failed_data = json.load(f)
+                    selected_movies = failed_data.get('failed_movie_ids', [])
+                    logging.info(f"Resuming crawl for {len(selected_movies)} previously failed movies")
+            except Exception as e:
+                logging.error(f"Error loading resume file {resume_from}: {e}")
+                # Tiếp tục với quy trình bình thường
+                selected_movies = []
+        
+        # Nếu không phải chế độ resume hoặc resume thất bại, thu thập movie IDs mới
+        if not selected_movies:
+            # 1. Thu thập movie IDs từ các nguồn khác nhau
+            all_movie_ids = set()
+            movie_sources = {}
+            
+            for source in sources:
+                try:
+                    # Điều chỉnh số trang theo cấu hình nguồn cụ thể nếu có
+                    source_pages = self.config.get_nested("data_sources", source, "pages", default=num_pages_per_source)
+                    movies = self.crawl_movie_list(source, source_pages)
+                    
+                    for movie in movies:
+                        movie_id = movie['id']
+                        all_movie_ids.add(movie_id)
+                        
+                        if movie_id not in movie_sources:
+                            movie_sources[movie_id] = []
+                        movie_sources[movie_id].append(source)
+                        
+                except Exception as e:
+                    logging.error(f"Error crawling {source}: {e}")
+                    continue
+            
+            logging.info(f"Collected {len(all_movie_ids)} unique movies from {len(sources)} sources")
+            
+            # 2. Lưu summary danh sách phim
+            movie_list_summary = {
+                'crawl_date': datetime.now().isoformat(),
+                'total_unique_movies': len(all_movie_ids),
+                'sources': sources,
+                'pages_per_source': num_pages_per_source,
+                'movie_sources': movie_sources
+            }
+            
+            summary_file = os.path.join(self.raw_data_dir, f"movie_list_summary_{timestamp}.json")
+            self.save_json(movie_list_summary, summary_file)
+            
+            # Giới hạn số lượng phim để crawl chi tiết
+            selected_movies = list(all_movie_ids)[:max_movies]
         
         logging.info(f"Crawling detailed info for {len(selected_movies)} movies...")
         
+        # Khởi tạo file dataset cho toàn bộ kết quả
+        dataset_header = {
+            'crawl_summary': {
+                'crawl_date': datetime.now().isoformat(),
+                'crawl_timestamp': timestamp,
+                'total_movies_attempted': len(selected_movies),
+                'sources': sources if not resume_from else "resume"
+            },
+            'movies': []
+        }
+        
+        final_file = os.path.join(self.raw_data_dir, f"netflix_raw_dataset_{timestamp}.json")
+        self.save_json(dataset_header, final_file)
+        
         detailed_movies = []
         failed_movies = []
+        batch_buffer = []
         
-        # Parallel crawling with ThreadPoolExecutor
-        max_workers = min(5, len(selected_movies))
+        # 3. Crawl thông tin chi tiết với xử lý song song
+        max_workers = min(self.max_workers, len(selected_movies))
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             # Submit all tasks
             future_to_id = {executor.submit(self.crawl_movie_details, movie_id): movie_id for movie_id in selected_movies}
@@ -267,21 +380,23 @@ class NetflixDataCrawler:
                     movie_data = future.result()
                     
                     if movie_data['details']:  # Only save if we got basic details
-                        movie_data['sources'] = movie_sources.get(movie_id, [])
+                        if not resume_from:  # Nếu không phải resume, thêm thông tin nguồn
+                            movie_data['sources'] = movie_sources.get(movie_id, [])
                         detailed_movies.append(movie_data)
+                        batch_buffer.append(movie_data)
                     else:
-                        failed_movies.append(movie_id)
+                        if movie_id not in failed_movies:  # Tránh thêm trùng lặp
+                            failed_movies.append(movie_id)
                     
-                    # Progress save every 25 movies
-                    if i % 25 == 0 or i == len(selected_movies):
-                        batch_file = os.path.join(self.raw_data_dir, 
-                                                  f"detailed_movies_batch_{i//25}_{timestamp}.json")
-                        self.save_json(detailed_movies[-25:], batch_file)
-                        logging.info(f"Saved batch {i//25}: {len(detailed_movies)} movies so far")
+                    # Progress save every batch_size movies
+                    if len(batch_buffer) >= self.batch_size or i == len(selected_movies):
+                        batch_file = self.save_movie_batch(batch_buffer, timestamp, i // self.batch_size)
+                        batch_buffer = []  # Reset buffer
                         
                 except Exception as e:
                     logging.error(f"Error crawling movie {movie_id}: {e}")
-                    failed_movies.append(movie_id)
+                    if movie_id not in failed_movies:  # Tránh thêm trùng lặp
+                        failed_movies.append(movie_id)
                     continue
         
         # 4. Lưu kết quả cuối cùng
@@ -297,8 +412,13 @@ class NetflixDataCrawler:
             'movies': detailed_movies
         }
         
-        final_file = os.path.join(self.raw_data_dir, f"netflix_raw_dataset_{timestamp}.json")
         self.save_json(final_results, final_file)
+        
+        # Lưu riêng danh sách phim thất bại để có thể retry sau
+        if failed_movies:
+            failed_file = os.path.join(self.raw_data_dir, f"failed_movies_{timestamp}.json")
+            self.save_json({'failed_movie_ids': failed_movies}, failed_file)
+            logging.info(f"Saved {len(failed_movies)} failed movie IDs to {failed_file}")
         
         logging.info(f"CRAWL COMPLETED!")
         logging.info(f"- Successfully crawled: {len(detailed_movies)} movies")
@@ -430,8 +550,20 @@ def main():
     """
     Main function to run crawler directly.
     """
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='Netflix Data Crawler')
+    parser.add_argument('--resume', help='Resume from failed movies file')
+    parser.add_argument('--max-movies', type=int, help='Maximum number of movies to crawl')
+    parser.add_argument('--pages', type=int, help='Number of pages per source')
+    parser.add_argument('--sources', nargs='+', help='Specific sources to crawl')
+    parser.add_argument('--log-dir', help='Directory for log files')
+    parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], 
+                        default='INFO', help='Logging level')
+    args = parser.parse_args()
+    
     # Setup logging
-    setup_logging()
+    log_level = getattr(logging, args.log_level)
+    setup_logging(log_dir=args.log_dir, log_level=log_level)
     
     logging.info("=== NETFLIX CRAWLER STARTING ===")
     
@@ -453,7 +585,12 @@ def main():
     
     # Run daily crawl
     try:
-        crawler.crawl_daily_netflix_data()
+        crawler.crawl_daily_netflix_data(
+            num_pages_per_source=args.pages,
+            max_movies=args.max_movies,
+            sources=args.sources,
+            resume_from=args.resume
+        )
         logging.info("Crawling completed successfully")
     except Exception as e:
         logging.error(f"Error during crawling: {e}")
