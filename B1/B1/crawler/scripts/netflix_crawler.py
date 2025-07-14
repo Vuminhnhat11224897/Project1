@@ -13,6 +13,8 @@ from typing import Dict, List, Optional, Set, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import hashlib
+from logging.handlers import RotatingFileHandler
+
 
 # Thêm các import cần thiết
 try:
@@ -495,54 +497,45 @@ class NetflixDataCrawler:
 
 def setup_logging(log_dir=None, log_level=logging.INFO):
     """
-    Configure logging to write to both file and console.
-    
+    Configure logging to write to both file and console (safe for Airflow).
     Args:
-        log_dir: Thư mục để lưu log file
+        log_dir: Folder to store log file
         log_level: Logging level
-        
     Returns:
         logger: Configured logger
     """
-    from logging.handlers import RotatingFileHandler
-    
     if log_dir is None:
-        # Try to get from environment
         log_dir = os.environ.get("LOGS_DIR", "logs")
-    
-    # Create logs directory if it doesn't exist
+
     os.makedirs(log_dir, exist_ok=True)
-    
-    # Create timestamped log filename
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = os.path.join(log_dir, f"netflix_crawler_{timestamp}.log")
-    
-    # Configure logger
-    logger = logging.getLogger()
+
+    # ✅ Tạo logger riêng biệt, không dùng root logger
+    logger = logging.getLogger("netflix_crawler")
     logger.setLevel(log_level)
-    
-    # Clear existing handlers if any
+    logger.propagate = False  # ⛔ Không lan lên root (Airflow logger)
+
+    # 🧹 Xóa handler cũ nếu có
     if logger.handlers:
         logger.handlers.clear()
-    
-    # Create file handler with rotation (max 5MB, keep 3 backups)
+
+    # File handler
     file_handler = RotatingFileHandler(
-        log_file, maxBytes=5*1024*1024, backupCount=3, encoding='utf-8'
+        log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8'
     )
-    
-    # Create console handler
-    console_handler = logging.StreamHandler()
-    
-    # Create formatter and add it to the handlers
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(formatter)
-    console_handler.setFormatter(formatter)
-    
-    # Add handlers to logger
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
     logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-    
-    logging.info(f"Logging configured. Log file: {log_file}")
+
+    # Console handler (tuỳ chọn, có thể tắt nếu chạy trong Airflow)
+    if os.environ.get("DOCKER_ENV", "").lower() != "true":
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(file_formatter)
+        logger.addHandler(console_handler)
+
+    # 🛑 Không dùng logging.info(...) ở đây — thay vào đó:
+    logger.info(f"✅ Logging configured. File: {log_file}")
     return logger
 
 
