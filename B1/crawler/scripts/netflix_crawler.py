@@ -14,8 +14,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import hashlib
 from logging.handlers import RotatingFileHandler
-
-
 # Thêm các import cần thiết
 try:
     # Import từ thư mục hiện tại khi chạy trực tiếp
